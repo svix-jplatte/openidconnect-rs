@@ -1,22 +1,23 @@
-use std::ops::Deref;
-use std::{marker::PhantomData, time::Duration};
+use std::{fmt::Display, marker::PhantomData, time::Duration};
 
 use crate::{
+    helpers::Timestamp,
     jwt::{JsonWebToken, JsonWebTokenJsonPayloadSerde},
-    types::helpers::{serde_utc_seconds, serde_utc_seconds_opt},
-    AdditionalClaims, Audience, AuthDisplay, AuthPrompt, GenderClaim, JsonWebKey, JsonWebKeyType,
-    JsonWebKeyUse, JsonWebTokenError, JweContentEncryptionAlgorithm, JwsSigningAlgorithm,
-    PrivateSigningKey, TokenResponse,
+    AdditionalClaims, Audience, AuthDisplay, AuthPrompt, GenderClaim, JsonWebKey,
+    JsonWebTokenError, JweContentEncryptionAlgorithm, JwsSigningAlgorithm, PrivateSigningKey,
+    TokenResponse,
 };
+use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use oauth2::{
-    ClientCredentialsTokenRequest, ErrorResponse, RevocableToken, TokenIntrospectionResponse,
-    TokenType,
+    ClientCredentialsTokenRequest, EndpointSet, EndpointState, ErrorResponse, RevocableToken,
+    TokenIntrospectionResponse,
 };
 use rand::{thread_rng, Rng};
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_with::serde_as;
 use std::fmt::Debug;
+
 ///
 /// Additional claims beyond the set of Standard Claims defined by OpenID Connect Core.
 ///
@@ -32,6 +33,7 @@ pub struct EmptyAdditionalClientAuthTokenClaims {}
 impl AdditionalClientAuthTokenClaims for EmptyAdditionalClientAuthTokenClaims {}
 
 /// FIXME: documentation
+#[serde_as]
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ClientAuthTokenClaims<AC> {
     #[serde(rename = "iss")]
@@ -43,23 +45,16 @@ pub struct ClientAuthTokenClaims<AC> {
     #[serde(rename = "aud")]
     audience: Audience,
 
-    #[serde(rename = "exp", with = "serde_utc_seconds")]
+    #[serde_as(as = "Timestamp")]
+    #[serde(rename = "exp")]
     expiration: DateTime<Utc>,
 
-    #[serde(
-        rename = "nbf",
-        default,
-        with = "serde_utc_seconds_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde_as(as = "Option<Timestamp>")]
+    #[serde(rename = "nbf", default, skip_serializing_if = "Option::is_none")]
     not_before: Option<DateTime<Utc>>,
 
-    #[serde(
-        rename = "iat",
-        default,
-        with = "serde_utc_seconds_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde_as(as = "Option<Timestamp>")]
+    #[serde(rename = "iat", default, skip_serializing_if = "Option::is_none")]
     issued_at: Option<DateTime<Utc>>,
 
     #[serde(rename = "jti", default, skip_serializing_if = "Option::is_none")]
@@ -94,49 +89,88 @@ impl ClientAuthTokenId {
     ///
     pub fn new_random_len(num_bytes: u32) -> Self {
         let random_bytes: Vec<u8> = (0..num_bytes).map(|_| thread_rng().gen::<u8>()).collect();
-        ClientAuthTokenId::new(base64::encode_config(random_bytes, base64::URL_SAFE_NO_PAD))
+        ClientAuthTokenId::new(BASE64_URL_SAFE_NO_PAD.encode(random_bytes))
     }
 }
 
-impl<AC, AD, GC, JE, JS, JT, JU, K, P, TE, TR, TT, TIR, RT, TRE>
-    crate::Client<AC, AD, GC, JE, JS, JT, JU, K, P, TE, TR, TT, TIR, RT, TRE>
+impl<
+        AC,
+        AD,
+        GC,
+        JE,
+        K,
+        P,
+        TE,
+        TR,
+        TIR,
+        RT,
+        TRE,
+        HasAuthUrl,
+        HasDeviceAuthUrl,
+        HasIntrospectionUrl,
+        HasRevocationUrl,
+        HasUserInfoUrl,
+    >
+    crate::Client<
+        AC,
+        AD,
+        GC,
+        JE,
+        K,
+        P,
+        TE,
+        TR,
+        TIR,
+        RT,
+        TRE,
+        HasAuthUrl,
+        HasDeviceAuthUrl,
+        HasIntrospectionUrl,
+        HasRevocationUrl,
+        EndpointSet,
+        HasUserInfoUrl,
+    >
 where
     // AC: AdditionalClientAuthTokenClaims,
     AC: AdditionalClaims,
-    // AC: AdditionalClaims,
     AD: AuthDisplay,
     GC: GenderClaim,
-    JE: JweContentEncryptionAlgorithm<JT>,
-    JS: JwsSigningAlgorithm<JT>,
-    JT: JsonWebKeyType,
-    JU: JsonWebKeyUse,
-    K: JsonWebKey<JS, JT, JU>,
+    JE: JweContentEncryptionAlgorithm<
+        KeyType = <K::SigningAlgorithm as JwsSigningAlgorithm>::KeyType,
+    >,
+    K: JsonWebKey,
     P: AuthPrompt,
     TE: ErrorResponse + 'static,
-    TR: TokenResponse<AC, GC, JE, JS, JT, TT>,
-    TT: TokenType + 'static,
-    TIR: TokenIntrospectionResponse<TT>,
+    TR: TokenResponse<AC, GC, JE, K::SigningAlgorithm>,
+    TIR: TokenIntrospectionResponse,
     RT: RevocableToken,
     TRE: ErrorResponse + 'static,
+    HasAuthUrl: EndpointState,
+    HasDeviceAuthUrl: EndpointState,
+    HasIntrospectionUrl: EndpointState,
+    HasRevocationUrl: EndpointState,
+    HasUserInfoUrl: EndpointState,
 {
     /// FIXME: documentation
-    pub fn client_auth_token_builder<S, RF, ATC>(
+    pub fn client_auth_token_builder<S, JS, RF, ATC>(
         &self,
         signing_key: S,
         signing_algo: JS,
         duration: Duration,
         jwt_id_method: RF,
         additional_claims: ATC,
-    ) -> ClientAuthTokenBuilder<ATC, JE, JS, JT, JU, K, RF, S>
+    ) -> ClientAuthTokenBuilder<ATC, JE, JS, K, RF, S>
     where
+        JS: JwsSigningAlgorithm<KeyType = JE::KeyType>,
         RF: FnOnce() -> ClientAuthTokenId,
         ATC: AdditionalClientAuthTokenClaims,
-        S: PrivateSigningKey<JS, JT, JU, K>,
+        S: PrivateSigningKey,
+        S::VerificationKey: JsonWebKey<SigningAlgorithm = JS>,
     {
         ClientAuthTokenBuilder::new(
             self.client_id.to_string(),
             self.client_id.to_string(),
-            Audience::new(self.oauth2_client.token_url().unwrap().to_string()),
+            Audience::new(self.oauth2_client.token_uri().to_string()),
             signing_key,
             signing_algo,
             duration,
@@ -146,11 +180,12 @@ where
     }
 
     /// FIXME: documentation
-    pub fn exchange_client_credential_with_auth_token<ATC>(
+    pub fn exchange_client_credential_with_auth_token<ATC, JS>(
         &self,
-        token: ClientAuthToken<ATC, JE, JS, JT>,
-    ) -> Result<ClientCredentialsTokenRequest<TE, TR, TT>, JsonWebTokenError>
+        token: ClientAuthToken<ATC, JE, JS>,
+    ) -> Result<ClientCredentialsTokenRequest<TE, TR>, JsonWebTokenError>
     where
+        JS: JwsSigningAlgorithm<KeyType = JE::KeyType>,
         ATC: AdditionalClientAuthTokenClaims,
     {
         let ccrt = self
@@ -168,13 +203,11 @@ where
 /// FIXME: documentation
 pub struct ClientAuthTokenBuilder<
     AC: AdditionalClientAuthTokenClaims,
-    JE: JweContentEncryptionAlgorithm<JT>,
-    JS: JwsSigningAlgorithm<JT>,
-    JT: JsonWebKeyType,
-    JU: JsonWebKeyUse,
-    K: JsonWebKey<JS, JT, JU>,
+    JE: JweContentEncryptionAlgorithm<KeyType = JS::KeyType>,
+    JS: JwsSigningAlgorithm,
+    K: JsonWebKey,
     RF: FnOnce() -> ClientAuthTokenId,
-    SK: PrivateSigningKey<JS, JT, JU, K>,
+    SK: PrivateSigningKey,
 > {
     issuer: String,
     subject: String,
@@ -187,19 +220,18 @@ pub struct ClientAuthTokenBuilder<
     include_nbf: bool,
     include_iat: bool,
     include_jti: bool,
-    _phantom_jt: PhantomData<(AC, JE, JS, RF, JT, JU, K, JS)>,
+    _phantom_jt: PhantomData<(AC, JE, JS, RF, K, JS)>,
 }
 
-impl<AC, JE, JS, JT, JU, K, RF, SK> ClientAuthTokenBuilder<AC, JE, JS, JT, JU, K, RF, SK>
+impl<AC, JE, JS, K, RF, SK> ClientAuthTokenBuilder<AC, JE, JS, K, RF, SK>
 where
     AC: AdditionalClientAuthTokenClaims,
-    JE: JweContentEncryptionAlgorithm<JT>,
-    JS: JwsSigningAlgorithm<JT>,
-    JT: JsonWebKeyType,
-    JU: JsonWebKeyUse,
-    K: JsonWebKey<JS, JT, JU>,
+    JE: JweContentEncryptionAlgorithm<KeyType = JS::KeyType>,
+    JS: JwsSigningAlgorithm,
+    K: JsonWebKey,
     RF: FnOnce() -> ClientAuthTokenId,
-    SK: PrivateSigningKey<JS, JT, JU, K>,
+    SK: PrivateSigningKey,
+    SK::VerificationKey: JsonWebKey<SigningAlgorithm = JS>,
 {
     /// FIXME: documentation
     #[allow(clippy::too_many_arguments)]
@@ -296,7 +328,7 @@ where
     }
 
     /// FIXME: documentation
-    pub fn build(self) -> Result<ClientAuthToken<AC, JE, JS, JT>, JsonWebTokenError> {
+    pub fn build(self) -> Result<ClientAuthToken<AC, JE, JS>, JsonWebTokenError> {
         let now = chrono::Utc::now();
 
         let expiration = now + self.duration;
@@ -339,23 +371,21 @@ where
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ClientAuthToken<
     AC: AdditionalClientAuthTokenClaims,
-    JE: JweContentEncryptionAlgorithm<JT>,
-    JS: JwsSigningAlgorithm<JT>,
-    JT: JsonWebKeyType,
+    JE: JweContentEncryptionAlgorithm<KeyType = JS::KeyType>,
+    JS: JwsSigningAlgorithm,
 >(
     #[serde(bound = "AC: AdditionalClientAuthTokenClaims")]
-    JsonWebToken<JE, JS, JT, ClientAuthTokenClaims<AC>, JsonWebTokenJsonPayloadSerde>,
+    JsonWebToken<JE, JS, ClientAuthTokenClaims<AC>, JsonWebTokenJsonPayloadSerde>,
 );
 
-impl<AC, JE, JS, JT> ClientAuthToken<AC, JE, JS, JT>
+impl<AC, JE, JS> ClientAuthToken<AC, JE, JS>
 where
     AC: AdditionalClientAuthTokenClaims,
-    JE: JweContentEncryptionAlgorithm<JT>,
-    JS: JwsSigningAlgorithm<JT>,
-    JT: JsonWebKeyType,
+    JE: JweContentEncryptionAlgorithm<KeyType = JS::KeyType>,
+    JS: JwsSigningAlgorithm,
 {
     /// FIXME: documentation
-    pub fn new<JU, K, S>(
+    pub fn new<S>(
         claims: ClientAuthTokenClaims<AC>,
         signing_key: &S,
         alg: JS,
@@ -363,30 +393,29 @@ where
         // code: Option<&AuthorizationCode>,
     ) -> Result<Self, JsonWebTokenError>
     where
-        JU: JsonWebKeyUse,
-        K: JsonWebKey<JS, JT, JU>,
-        S: PrivateSigningKey<JS, JT, JU, K>,
+        S: PrivateSigningKey,
+        S::VerificationKey: JsonWebKey<SigningAlgorithm = JS>,
     {
         JsonWebToken::new(ClientAuthTokenClaims { ..claims }, signing_key, &alg).map(Self)
     }
 }
 
-impl<AC, JE, JS, JT> ToString for ClientAuthToken<AC, JE, JS, JT>
+impl<AC, JE, JS> Display for ClientAuthToken<AC, JE, JS>
 where
     AC: AdditionalClientAuthTokenClaims,
-    JE: JweContentEncryptionAlgorithm<JT>,
-    JS: JwsSigningAlgorithm<JT>,
-    JT: JsonWebKeyType,
+    JE: JweContentEncryptionAlgorithm<KeyType = JS::KeyType>,
+    JS: JwsSigningAlgorithm,
 {
-    fn to_string(&self) -> String {
-        serde_json::to_value(self)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let val = serde_json::to_value(self)
             // This should never arise, since we're just asking serde_json to serialize the
             // signing input concatenated with the signature, both of which are precomputed.
-            .expect("ID token serialization failed")
-            .as_str()
-            // This should also never arise, since our IdToken serializer always calls serialize_str
-            .expect("ID token serializer did not produce a str")
-            .to_owned()
+            .expect("ID token serialization failed");
+        f.write_str(
+            val.as_str()
+                // This should also never arise, since our IdToken serializer always calls serialize_str
+                .expect("ID token serializer did not produce a str"),
+        )
     }
 }
 

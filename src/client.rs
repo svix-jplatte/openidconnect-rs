@@ -129,7 +129,7 @@ pub struct Client<
     HasTokenUrl: EndpointState,
     HasUserInfoUrl: EndpointState,
 {
-    oauth2_client: oauth2::Client<
+    pub(crate) oauth2_client: oauth2::Client<
         TE,
         TR,
         TIR,
